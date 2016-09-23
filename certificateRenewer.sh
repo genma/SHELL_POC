@@ -1,0 +1,204 @@
+#!/bin/bash
+
+###############################################################################
+# Inspired from                                                               #
+# https://community.letsencrypt.org/t/                                        #
+# how-to-completely-automating-certificate-renewals-on-debian/5615            #
+###############################################################################
+
+###################
+#  Configuration  #
+###################
+
+# This line MUST be present in all scripts executed by cron!
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# Certs that will expire in less than this value will be renewed
+REMAINING_DAYS_TO_RENEW=30
+
+# Command to execute if certs have been renewed
+SERVICES_TO_RESTART="nginx postfix" #metronome
+
+# Parameters for email alert
+EMAIL_ALERT_FROM="cron-certrenewer@genma.fr"
+EMAIL_ALERT_TO="mail@mail.com"
+EMAIL_ALERT_SUBJ="WARNING: SSL certificate renewal for CERT_NAME failed!"
+
+# Letsencrypt stuff
+
+# The executable
+LEBIN="/root/.letsencrypt/letsencrypt-auto"
+# The config file
+LECFG="/etc/letsencrypt/conf.ini"
+# The directory where current .pem certificates are stored
+LELIVE="/etc/letsencrypt/live"
+# Renewal directory, which contains renewal configs for all certificates.
+LERENEWAL="/etc/letsencrypt/renewal"
+
+################
+#  Misc tools  #
+################
+
+# -----------------------------------
+# Given a certificate file, return the number of days before it expires
+# -----------------------------------
+function daysBeforeCertificateExpire()
+{
+    local CERT_FILE=$1
+    local DATE_EXPIRE=$(openssl x509 -in $CERT_FILE -text -noout \
+                       | grep "Not After"                        \
+                       | cut -c 25-)
+    local D1=$(date -d "$DATE_EXPIRE" +%s)
+    local D2=$(date -d "now"        +%s)
+    local DAYS_EXP=$(( ( D1 - D2) / 86400 ))
+    echo $DAYS_EXP
+}
+
+# -----------------------------------
+# Send an alert email stating that the renewing of a cert failed, and paste the
+# logs into the mail body
+# -----------------------------------
+function sendAlert()
+{
+    local CERT_NAME=$1
+    local LOG_FILE=$2
+    local SUBJ=$(echo $EMAIL_ALERT_SUBJ | sed "s/CERT_NAME/${CERT_NAME}/g")
+
+    echo -e " Here is the log of what happened\n"             \
+            "Consider also checking /var/log/letsencrypt/\n"  \
+            "--------------------------------------------\n"  \
+    | cat - ${LOG_FILE}                                       \
+    | mail -s "${SUBJ}"                                       \
+    #       to-adr "${EMAIL_ALERT_FROM}"                           \
+               ${EMAIL_ALERT_TO}
+}
+
+# -----------------------------------
+# -----------------------------------
+function restartServices()
+{
+    eval "/bin/sync"
+
+    local SERVICE
+    for SERVICE in ${SERVICES_TO_RESTART}
+    do
+        eval "service ${SERVICE} restart"
+    done
+}
+
+###############################
+#  Actual lets encrypt stuff  #
+###############################
+
+# -----------------------------------
+# Given a certificate name, echo True or False if it will soon expire
+# (see REMAINING_DAYS_TO_RENEW)
+# -----------------------------------
+function certificateNeedsToBeRenewed()
+{
+    local CERT_NAME=$1
+    local CERT_FILE="${LELIVE}/${CERT_NAME}/cert.pem"
+    local DAYS_BEFORE_EXPIRE=`daysBeforeCertificateExpire $CERT_FILE`
+
+    if [[ ${DAYS_BEFORE_EXPIRE} -lt ${REMAINING_DAYS_TO_RENEW} ]]
+    then
+        echo "True"
+    else
+        echo "False"
+    fi
+}
+
+# -----------------------------------
+# Given a certificate name, attempt to renew it
+# Stuff is logged in a file
+# -----------------------------------
+function renewCertificate()
+{
+    local CERT_NAME=$1
+    local LOG_FILE=$2
+    local CERT_FILE="${LELIVE}/${CERT_NAME}/cert.pem"
+    local CERT_CONF="${LERENEWAL}/${CERT_NAME}.conf"
+    # Parse "domains = xxxx", we might need to remove the last character
+    # if it's a comma
+    local DOMAINS=$(grep -o --perl-regex "(?<=domains \= ).*" "${CERT_CONF}")
+    local LAST_CHAR=$(echo ${DOMAINS} | awk '{print substr($0,length,1)}')
+    if [ "${LAST_CHAR}" = "," ]
+    then
+        local DOMAINS=$(echo ${DOMAINS} |awk '{print substr($0, 1, length-1)}')
+    fi
+
+    # Recreate the webroot folder (expected to be in /tmp/)
+    WEBROOT_PATH=$(cat $CERT_CONF    \
+                 | grep webroot_path \
+                 | tr ',' ' '        \
+                 | awk '{print $3}')
+    mkdir -p ${WEBROOT_PATH}
+
+    rm ${LOG_FILE}
+    touch ${LOG_FILE}
+    ${LEBIN} certonly          \
+        --renew-by-default     \
+        --config "${LECFG}"    \
+        --domains "${DOMAINS}" \
+        > ${LOG_FILE} 2>&1
+}
+
+# -----------------------------------
+# Attempt to renew all certificates in LELIVE directory
+# -----------------------------------
+function renewAllCertificates()
+{
+    local AT_LEAST_ONE_CERT_RENEWED="False"
+
+    # Loop on certificates in live directory
+    local CERT
+    for CERT in $(ls -1 "${LELIVE}")
+    do
+        echo "Checking $CERT certificate ..."
+        # Check if current certificate needs to be renewed
+        if [[ `certificateNeedsToBeRenewed ${CERT}` == "True" ]]
+        then
+            echo " > Needs to be renewed. Attempting to ..."
+
+            # If yes, attempt to renew it
+            local LOG_FILE="/tmp/cron-cert-renewer.log"
+            renewCertificate ${CERT} ${LOG_FILE}
+
+            # Check it worked
+            if [[ `certificateNeedsToBeRenewed $CERT` == "False" ]]
+            then
+                echo " > Cert was succesfully renewed."
+                local AT_LEAST_ONE_CERT_RENEWED="True"
+            else
+                echo " > An error occured, an email was sent."
+                sendAlert ${CERT} ${LOG_FILE}
+            fi
+        else
+            echo " > No need to renew it."
+        fi
+    done
+
+    if [[ ${AT_LEAST_ONE_CERT_RENEWED} == "True" ]]
+    then
+        return 1
+    else
+        return 0
+    fi
+}
+
+###################
+#  Main function  #
+###################
+
+function main()
+{
+    renewAllCertificates
+
+    if [[ $? -eq 1 ]]
+    then
+        restartServices
+    fi
+
+}
+main
+
